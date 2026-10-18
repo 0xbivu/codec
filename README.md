@@ -41,3 +41,7 @@ b58 is pure bash bignum math, so keep it to keys/addresses, not files.
 Install: `ln -s "$PWD/codec" ~/.local/bin/codec`
 
 Tests: `./test.sh`
+
+---
+
+Built with help from Claude.
