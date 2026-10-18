@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# codec - quick encode/decode from the terminal
+set -euo pipefail
+
+B58=123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
+
+usage() {
+	cat <<-'USAGE'
+	usage: codec [-d] <format>[,format...] [text]
+
+	  -d    decode instead of encode
+	  text  reads stdin if not given
+
+	formats:
+	  b64 b64url b32 b58 hex bin dec oct url html rot13
+
+	chain with commas, applied left to right:
+	  codec hex,b64 hi             # hex, then base64
+	  codec -d b64,hex Njg2OQ==    # and back
+
+	  codec b64 hello
+	  echo aGVsbG8 | codec -d b64
+	  codec -d hex 68:65:6c 0x6c \x6f
+	USAGE
+}
+
+die() { echo "codec: $*" >&2; exit 1; }
+
+input() { if (($#)); then printf '%s' "$*"; else cat; fi; }
+
+# decoders take text; $(...) would silently drop a NUL, so refuse it
+# ponytail: bash read is byte-at-a-time on pipes, slow past a few MB
+nonul() { local s; IFS= read -r -d '' s && die 'NUL byte in input'; printf '%s' "$s"; }
+
+# strip whitespace and fix missing '=' padding (jwt-style b64 etc)
+pad() {
+	local s
+	s=$(tr -d '[:space:]')
+	while ((${#s} % $1)); do s+='='; done
+	printf '%s' "$s"
+}
+
+# bytes -> "104 105", od type u (decimal) or o (octal)
+num_enc() { od -An -v -t"${1}1" | tr -s ' \n' ' ' | sed 's/^ //; s/ $//'; }
+
+# "104 105" / "104,105" -> bytes. $1 = base, $2 = valid token regex
+num_dec() {
+	local s n out=
+	local -a toks
+	s=$(tr ',\n' '  ')
+	read -ra toks <<<"$s" || true
+	for n in "${toks[@]}"; do
+		[[ $n =~ $2 ]] && (($1#$n < 256)) || die "bad byte: $n"
+		printf -v n '\\x%02x' "$(($1#$n))"
+		out+=$n
+	done
+	printf '%b' "$out"
+}
+
+enc_b64()    { basenc --base64 -w0; }
+dec_b64()    { pad 4 | basenc --base64 -d; }
+enc_b64url() { basenc --base64url -w0 | tr -d =; }
+dec_b64url() { pad 4 | basenc --base64url -d; }
+enc_b32()    { basenc --base32 -w0; }
+dec_b32()    { pad 8 | basenc --base32 -d; }
+enc_hex()    { basenc --base16 -w0 | tr A-F a-f; }
+dec_hex()    { tr -d '[:space:]:,' | sed 's/0[xX]//g; s/\\x//g' | tr a-f A-F | basenc --base16 -d; }
+enc_bin()    { basenc --base2msbf -w0 | sed 's/.\{8\}/& /g; s/ $//'; }
+dec_bin()    { tr -d '[:space:]' | basenc --base2msbf -d; }
+enc_dec()    { num_enc u; }
+dec_dec()    { num_dec 10 '^[0-9]{1,3}$'; }
+enc_oct()    { num_enc o; }
+dec_oct()    { num_dec 8 '^[0-7]{1,3}$'; }
+enc_rot13()  { tr 'A-Za-z' 'N-ZA-Mn-za-m'; }
+dec_rot13()  { enc_rot13; }
+
+# byte at a time so NULs and newlines survive
+enc_url() {
+	local LC_ALL=C c out=
+	while IFS= read -r -d '' -n 1 c; do
+		case $c in
+			'') out+=%00 ;;
+			[a-zA-Z0-9.~_-]) out+=$c ;;
+			*) printf -v c '%%%02X' "'$c"; out+=$c ;;
+		esac
+	done
+	printf '%s' "$out"
+}
+
+dec_url() {
+	local s
+	s=$(cat)
+	[[ ${s//%[[:xdigit:]][[:xdigit:]]/} != *%* ]] || die 'bad % escape'
+	s=${s//\\/\\\\}
+	s=${s//+/ }
+	printf '%b' "${s//%/\\x}"
+}
+
+enc_html() { sed "s/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\"/\&quot;/g; s/'/\&#39;/g"; }
+
+dec_html() {
+	# \U needs a utf-8 locale or it prints the escape literally
+	local LC_ALL=C.UTF-8 s out= ent c cp re='&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|amp|lt|gt|quot|apos|nbsp);'
+	s=$(cat; echo .)
+	s=${s%.}
+	while [[ $s =~ $re ]]; do
+		out+=${s%%"${BASH_REMATCH[0]}"*}
+		s=${s#*"${BASH_REMATCH[0]}"}
+		ent=${BASH_REMATCH[1]}
+		case $ent in
+			amp) c='&' ;; lt) c='<' ;; gt) c='>' ;; quot) c='"' ;; apos) c="'" ;;
+			nbsp) c=$'\xc2\xa0' ;;
+			'#'*)
+				[[ $ent == '#'[xX]* ]] && cp=$((16#${ent:2})) || cp=$((10#${ent:1}))
+				((cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff))) || die "bad entity: &$ent;"
+				printf -v cp '%08x' "$cp"
+				printf -v c "\\U$cp"
+				;;
+		esac
+		out+=$c
+	done
+	printf '%s' "$out$s"
+}
+
+# ponytail: O(n^2) bignum in bash, fine for keys/addresses, slow past a few KB
+enc_b58() {
+	local -a b d=()
+	local x carry i out=
+	b=($(od -An -v -tu1))
+	for x in "${b[@]}"; do ((x)) && break; out+=1; done
+	for x in "${b[@]}"; do
+		carry=$x
+		for ((i = 0; i < ${#d[@]}; i++)); do
+			carry=$((carry + d[i] * 256)); d[i]=$((carry % 58)); carry=$((carry / 58))
+		done
+		while ((carry)); do d+=($((carry % 58))); carry=$((carry / 58)); done
+	done
+	for ((i = ${#d[@]} - 1; i >= 0; i--)); do out+=${B58:d[i]:1}; done
+	printf '%s' "$out"
+}
+
+dec_b58() {
+	local -a b=()
+	local s c rest carry i j out=
+	s=$(tr -d '[:space:]')
+	for ((i = 0; i < ${#s}; i++)); do [[ ${s:i:1} == 1 ]] || break; out+='\x00'; done
+	for ((i = 0; i < ${#s}; i++)); do
+		c=${s:i:1}
+		rest=${B58%%"$c"*}
+		((${#rest} < 58)) || die "bad base58 char: $c"
+		carry=${#rest}
+		for ((j = 0; j < ${#b[@]}; j++)); do
+			carry=$((carry + b[j] * 58)); b[j]=$((carry & 255)); carry=$((carry >> 8))
+		done
+		while ((carry)); do b+=($((carry & 255))); carry=$((carry >> 8)); done
+	done
+	for ((j = ${#b[@]} - 1; j >= 0; j--)); do printf -v c '\\x%02x' "${b[j]}"; out+=$c; done
+	printf '%b' "$out"
+}
+
+run() {
+	(($#)) || { cat; return; }
+	local f=$1
+	shift
+	if ((dec)); then nonul | "dec_$f"; else "enc_$f"; fi | run "$@"
+}
+
+dec=0
+case ${1:-} in
+	-h | --help) usage; exit 0 ;;
+	-d) dec=1; shift ;;
+esac
+(($#)) || { usage >&2; exit 1; }
+IFS=, read -ra fmts <<<"$1"
+shift
+((${#fmts[@]})) || { usage >&2; exit 1; }
+for f in "${fmts[@]}"; do
+	declare -F "enc_$f" >/dev/null || die "unknown format '$f' (try -h)"
+done
+
+input "$@" | run "${fmts[@]}"
+
+# text encodings end with a newline; raw output only gets one on a terminal
+last=${fmts[-1]}
+if ((!dec)) && [[ $last != rot13 && $last != html ]]; then
+	echo
+elif [[ -t 1 ]]; then
+	echo
+fi
