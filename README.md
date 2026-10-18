@@ -1,7 +1,39 @@
 # codec
 
 Small bash script for encoding/decoding stuff without opening CyberChef.
-Needs bash 4.4+ and GNU coreutils 8.31+ (`basenc`).
+Works offline, nothing leaves your machine.
+
+## Install
+
+```sh
+git clone git@github.com:0xbivu/codec.git
+cd codec
+./test.sh                                   # optional, should print all ok
+mkdir -p ~/.local/bin
+ln -s "$PWD/codec" ~/.local/bin/codec
+```
+
+Then `codec -h` from anywhere. If you get `command not found`, `~/.local/bin`
+isn't on your PATH yet:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+```
+
+Prefer a system-wide install? `sudo cp codec /usr/local/bin/`
+
+Since it's a symlink, `git pull` in the repo updates it. To remove it:
+`rm ~/.local/bin/codec`.
+
+### Requirements
+
+- bash 4.4+
+- GNU coreutils 8.31+ (for `basenc`)
+
+Any recent Linux has both. On macOS: `brew install bash coreutils` and put
+`$(brew --prefix)/opt/coreutils/libexec/gnubin` on your PATH.
+
+## Usage
 
 ```
 codec [-d] <format>[,format...] [text]
@@ -37,10 +69,6 @@ Reads stdin when no text is given, so it pipes: `codec b64 < file > out`.
 Decoding rejects garbage (bad padding, `%GG`, NUL bytes, ...) with a nonzero exit.
 
 b58 is pure bash bignum math, so keep it to keys/addresses, not files.
-
-Install: `ln -s "$PWD/codec" ~/.local/bin/codec`
-
-Tests: `./test.sh`
 
 ---
 
